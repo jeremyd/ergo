@@ -24,6 +24,7 @@ import (
 	"github.com/ergochat/ergo/irc/email"
 	"github.com/ergochat/ergo/irc/migrations"
 	"github.com/ergochat/ergo/irc/modes"
+	"github.com/ergochat/ergo/irc/nostr"
 	"github.com/ergochat/ergo/irc/oauth2"
 	"github.com/ergochat/ergo/irc/passwd"
 	"github.com/ergochat/ergo/irc/utils"
@@ -48,6 +49,7 @@ const (
 	keyAccountSuspended        = "account.suspended %s" // client realname stored as string
 	keyAccountPwReset          = "account.pwreset %s"
 	keyAccountEmailChange      = "account.emailchange %s"
+	keyAccountNostrIdentifier  = "account.nostridentifier %s" // stores the nostr identifier used during registration
 	// for an always-on client, a map of channel names they're in to their current modes
 	// (not to be confused with their amodes, which a non-always-on client can have):
 	keyAccountChannelToModes    = "account.channeltomodes %s"
@@ -400,7 +402,6 @@ func (am *AccountManager) Register(client *Client, account string, callbackNames
 	credentialsKey := fmt.Sprintf(keyAccountCredentials, casefoldedAccount)
 	verificationCodeKey := fmt.Sprintf(keyAccountVerificationCode, casefoldedAccount)
 	settingsKey := fmt.Sprintf(keyAccountSettings, casefoldedAccount)
-	certFPKey := fmt.Sprintf(keyCertToAccount, certfp)
 
 	var creds AccountCredentials
 	creds.Version = 1
@@ -446,13 +447,13 @@ func (am *AccountManager) Register(client *Client, account string, callbackNames
 			}
 
 			_, err = am.loadRawAccount(tx, casefoldedAccount)
-			if err != errAccountDoesNotExist {
-				return errAccountAlreadyRegistered
+			if err != nil && err != errAccountDoesNotExist {
+				return err
 			}
 
 			if certfp != "" {
 				// make sure certfp doesn't already exist because that'd be silly
-				_, err := tx.Get(certFPKey)
+				_, err := tx.Get(fmt.Sprintf(keyCertToAccount, certfp))
 				if err != buntdb.ErrNotFound {
 					return errCertfpAlreadyExists
 				}
@@ -463,9 +464,6 @@ func (am *AccountManager) Register(client *Client, account string, callbackNames
 			tx.Set(registeredTimeKey, registeredTimeStr, setOptions)
 			tx.Set(credentialsKey, credStr, setOptions)
 			tx.Set(settingsKey, settingsStr, setOptions)
-			if certfp != "" {
-				tx.Set(certFPKey, casefoldedAccount, setOptions)
-			}
 			return nil
 		})
 	}()
@@ -751,6 +749,26 @@ func (am *AccountManager) loadPushSubscriptions(account string) (result []stored
 	}
 }
 
+func (am *AccountManager) saveNostrIdentifier(account string, nostrIdentifier string) {
+	key := fmt.Sprintf(keyAccountNostrIdentifier, account)
+	am.server.logger.Info("nostr-hostname", "Saving nostr identifier:", nostrIdentifier, "for account:", account, "with key:", key)
+	am.server.store.Update(func(tx *buntdb.Tx) error {
+		tx.Set(key, nostrIdentifier, nil)
+		return nil
+	})
+}
+
+func (am *AccountManager) loadNostrIdentifier(account string) (nostrIdentifier string) {
+	key := fmt.Sprintf(keyAccountNostrIdentifier, account)
+	am.server.logger.Info("nostr-hostname", "Loading nostr identifier for account:", account, "with key:", key)
+	am.server.store.View(func(tx *buntdb.Tx) error {
+		nostrIdentifier, _ = tx.Get(key)
+		return nil
+	})
+	am.server.logger.Info("nostr-hostname", "Loaded nostr identifier:", nostrIdentifier, "for account:", account)
+	return
+}
+
 func (am *AccountManager) addRemoveCertfp(account, certfp string, add bool, hasPrivs bool) (err error) {
 	certfp, err = utils.NormalizeCertfp(certfp)
 	if err != nil {
@@ -801,20 +819,18 @@ func (am *AccountManager) addRemoveCertfp(account, certfp string, add bool, hasP
 		return err
 	}
 
-	certfpKey := fmt.Sprintf(keyCertToAccount, certfp)
 	err = am.server.store.Update(func(tx *buntdb.Tx) error {
 		curCredStr, err := tx.Get(credKey)
 		if credStr != curCredStr {
 			return errCASFailed
 		}
 		if add {
-			_, err = tx.Get(certfpKey)
+			_, err = tx.Get(fmt.Sprintf(keyCertToAccount, certfp))
 			if err != buntdb.ErrNotFound {
 				return errCertfpAlreadyExists
 			}
-			tx.Set(certfpKey, cfAccount, nil)
 		} else {
-			tx.Delete(certfpKey)
+			tx.Delete(fmt.Sprintf(keyCertToAccount, certfp))
 		}
 		_, _, err = tx.Set(credKey, newCredStr, nil)
 		return err
@@ -828,6 +844,8 @@ func (am *AccountManager) dispatchCallback(client *Client, account string, callb
 		return "", nil
 	} else if callbackNamespace == "mailto" {
 		return am.dispatchMailtoCallback(client, account, callbackValue)
+	} else if callbackNamespace == "nostr" {
+		return am.dispatchNostrCallback(client, account, callbackValue)
 	} else {
 		return "", fmt.Errorf("Callback not implemented: %s", callbackNamespace)
 	}
@@ -839,7 +857,7 @@ func (am *AccountManager) dispatchMailtoCallback(client *Client, account string,
 
 	subject := config.VerifyMessageSubject
 	if subject == "" {
-		subject = fmt.Sprintf(client.t("Verify your account on %s"), am.server.name)
+		subject = fmt.Sprintf(client.t("Verify your account on %s"), am.server.Config().Server.Name)
 	}
 
 	message := email.ComposeMail(config, callbackValue, subject)
@@ -857,6 +875,35 @@ func (am *AccountManager) dispatchMailtoCallback(client *Client, account string,
 		am.server.logger.Error("internal", "Failed to dispatch e-mail to", callbackValue, err.Error())
 	}
 	return
+}
+
+func (am *AccountManager) dispatchNostrCallback(_ *Client, account string, callbackValue string) (code string, err error) {
+	config := am.server.Config().Accounts.Registration.NostrVerification
+	if !config.Enabled {
+		return "", fmt.Errorf("Nostr verification is not enabled")
+	}
+
+	code = utils.GenerateSecretToken()
+
+	// Create DM config from server config
+	dmConfig := nostr.DMConfig{
+		PrivateKey:    config.PrivateKey,
+		DefaultRelays: config.DefaultRelays,
+		Timeout:       time.Duration(config.Timeout),
+		UserAgent:     fmt.Sprintf("Ergo IRC Server %s", am.server.Config().Server.Name),
+	}
+
+	// Send the verification DM
+	err = nostr.SendVerificationDM(callbackValue, account, code, am.server.Config().Server.Name, dmConfig)
+	if err != nil {
+		am.server.logger.Error("internal", "Failed to dispatch nostr DM to", callbackValue, err.Error())
+		return "", err
+	}
+
+	// Save the nostr identifier for hostname generation
+	am.saveNostrIdentifier(account, callbackValue)
+
+	return code, nil
 }
 
 func (am *AccountManager) Verify(client *Client, account string, code string, admin bool) error {
@@ -949,15 +996,6 @@ func (am *AccountManager) Verify(client *Client, account string, code string, ad
 			tx.Set(credentialsKey, raw.Credentials, nil)
 			tx.Set(settingsKey, raw.Settings, nil)
 
-			var creds AccountCredentials
-			// XXX we shouldn't do (de)serialization inside the txn,
-			// but this is like 2 usec on my system
-			json.Unmarshal([]byte(raw.Credentials), &creds)
-			for _, cert := range creds.Certfps {
-				certFPKey := fmt.Sprintf(keyCertToAccount, cert)
-				tx.Set(certFPKey, casefoldedAccount, nil)
-			}
-
 			return nil
 		})
 
@@ -993,7 +1031,7 @@ func (am *AccountManager) Verify(client *Client, account string, code string, ad
 	_, method := am.EnforcementStatus(casefoldedAccount, skeleton)
 	if method == NickEnforcementStrict {
 		currentClient := am.server.clients.Get(casefoldedAccount)
-		if currentClient != nil && currentClient != client && currentClient.Account() != casefoldedAccount {
+		if currentClient != nil && currentClient.AlwaysOn() {
 			am.server.RandomlyRename(currentClient)
 		}
 	}
@@ -1038,6 +1076,7 @@ func (am *AccountManager) NsSetEmail(client *Client, emailAddr string) (err erro
 	recordKey := fmt.Sprintf(keyAccountEmailChange, casefoldedAccount)
 	recordBytes, _ := json.Marshal(record)
 	recordVal := string(recordBytes)
+
 	am.server.store.Update(func(tx *buntdb.Tx) error {
 		tx.Set(recordKey, recordVal, nil)
 		return nil
@@ -1049,8 +1088,8 @@ func (am *AccountManager) NsSetEmail(client *Client, emailAddr string) (err erro
 
 	message := email.ComposeMail(config.Accounts.Registration.EmailVerification,
 		emailAddr,
-		fmt.Sprintf(client.t("Verify your change of e-mail address on %s"), am.server.name))
-	message.WriteString(fmt.Sprintf(client.t("To confirm your change of e-mail address on %s, issue the following command:"), am.server.name))
+		fmt.Sprintf(client.t("Verify your change of e-mail address on %s"), am.server.Config().Server.Name))
+	message.WriteString(fmt.Sprintf(client.t("To confirm your change of e-mail address on %s, issue the following command:"), am.server.Config().Server.Name))
 	message.WriteString("\r\n")
 	fmt.Fprintf(&message, "/MSG NickServ VERIFYEMAIL %s\r\n", record.Code)
 
@@ -1153,9 +1192,9 @@ func (am *AccountManager) NsSendpass(client *Client, accountName string) (err er
 		return
 	}
 
-	subject := fmt.Sprintf(client.t("Reset your password on %s"), am.server.name)
+	subject := fmt.Sprintf(client.t("Reset your password on %s"), am.server.Config().Server.Name)
 	message := email.ComposeMail(config.Accounts.Registration.EmailVerification, account.Settings.Email, subject)
-	fmt.Fprintf(&message, client.t("We received a request to reset your password on %[1]s for account: %[2]s"), am.server.name, account.Name)
+	fmt.Fprintf(&message, client.t("We received a request to reset your password on %[1]s for account: %[2]s"), am.server.Config().Server.Name, account.Name)
 	message.WriteString("\r\n")
 	message.WriteString(client.t("If you did not initiate this request, you can safely ignore this message."))
 	message.WriteString("\r\n")
@@ -1181,7 +1220,7 @@ func (am *AccountManager) NsResetpass(client *Client, accountName, code, passwor
 	}
 	account, err := am.LoadAccount(accountName)
 	if err != nil {
-		return
+		return err
 	}
 	if !account.Verified {
 		return errAccountUnverified
@@ -1842,6 +1881,7 @@ func (am *AccountManager) Rename(oldName, newName string) (err error) {
 		tx.Set(key, newName, nil)
 		return nil
 	})
+
 	if err != nil {
 		return err
 	}
@@ -1880,6 +1920,7 @@ func (am *AccountManager) Unregister(account string, erase bool) error {
 	pwResetKey := fmt.Sprintf(keyAccountPwReset, casefoldedAccount)
 	emailChangeKey := fmt.Sprintf(keyAccountEmailChange, casefoldedAccount)
 	pushSubscriptionsKey := fmt.Sprintf(keyAccountPushSubscriptions, casefoldedAccount)
+	nostrIdentifierKey := fmt.Sprintf(keyAccountNostrIdentifier, casefoldedAccount)
 
 	var clients []*Client
 	defer func() {
@@ -1939,22 +1980,25 @@ func (am *AccountManager) Unregister(account string, erase bool) error {
 		tx.Delete(pwResetKey)
 		tx.Delete(emailChangeKey)
 		tx.Delete(pushSubscriptionsKey)
+		tx.Delete(nostrIdentifierKey)
 
 		return nil
 	})
 
-	if err == nil {
-		var creds AccountCredentials
-		if err := json.Unmarshal([]byte(credText), &creds); err == nil {
-			for _, cert := range creds.Certfps {
-				certFPKey := fmt.Sprintf(keyCertToAccount, cert)
-				am.server.store.Update(func(tx *buntdb.Tx) error {
-					if account, err := tx.Get(certFPKey); err == nil && account == casefoldedAccount {
-						tx.Delete(certFPKey)
-					}
-					return nil
-				})
-			}
+	if err != nil {
+		return err
+	}
+
+	var creds AccountCredentials
+	if err := json.Unmarshal([]byte(credText), &creds); err == nil {
+		for _, cert := range creds.Certfps {
+			certFPKey := fmt.Sprintf(keyCertToAccount, cert)
+			am.server.store.Update(func(tx *buntdb.Tx) error {
+				if account, err := tx.Get(certFPKey); err == nil && account == casefoldedAccount {
+					tx.Delete(certFPKey)
+				}
+				return nil
+			})
 		}
 	}
 
@@ -1991,229 +2035,40 @@ func unmarshalRegisteredChannels(channelsStr string) (result []string) {
 	return
 }
 
-func (am *AccountManager) AuthenticateByCertificate(client *Client, certfp string, peerCerts []*x509.Certificate, authzid string) (err error) {
-	if certfp == "" {
-		return errAccountInvalidCredentials
-	}
-
-	var clientAccount ClientAccount
-
-	defer func() {
-		if err != nil {
-			return
-		} else if !clientAccount.Verified {
-			err = errAccountUnverified
-			return
-		} else if clientAccount.Suspended != nil {
-			err = errAccountSuspended
-			return
-		}
-		// TODO(#1109) clean this check up?
-		if client.registered {
-			if clientAlready := am.server.clients.Get(clientAccount.Name); clientAlready != nil && clientAlready.AlwaysOn() {
-				err = errNickAccountMismatch
-				return
-			}
-		}
-		am.Login(client, clientAccount)
-		return
-	}()
-
-	config := am.server.Config()
-	if config.Accounts.AuthScript.Enabled {
-		var output AuthScriptOutput
-		output, err = CheckAuthScript(am.server.semaphores.AuthScript, config.Accounts.AuthScript.ScriptConfig,
-			AuthScriptInput{Certfp: certfp, IP: client.IP().String(), peerCerts: peerCerts})
-		if err != nil {
-			am.server.logger.Error("internal", "failed shell auth invocation", err.Error())
-		} else if output.Success && output.AccountName != "" {
-			clientAccount, err = am.loadWithAutocreation(output.AccountName, config.Accounts.AuthScript.Autocreate)
-			return
-		}
-	}
-
-	var account string
-	certFPKey := fmt.Sprintf(keyCertToAccount, certfp)
-
-	err = am.server.store.View(func(tx *buntdb.Tx) error {
-		account, _ = tx.Get(certFPKey)
-		if account == "" {
-			return errAccountInvalidCredentials
-		}
-		return nil
-	})
-
-	if err != nil {
-		return err
-	}
-
-	if authzid != "" {
-		if cfAuthzid, err := CasefoldName(authzid); err != nil || cfAuthzid != account {
-			return errAuthzidAuthcidMismatch
-		}
-	}
-
-	// ok, we found an account corresponding to their certificate
-	clientAccount, err = am.LoadAccount(account)
-	return err
-}
-
-type settingsMunger func(input AccountSettings) (output AccountSettings, err error)
-
-func (am *AccountManager) ModifyAccountSettings(account string, munger settingsMunger) (newSettings AccountSettings, err error) {
-	casefoldedAccount, err := CasefoldName(account)
-	if err != nil {
-		return newSettings, errAccountDoesNotExist
-	}
-	// TODO implement this in general via a compare-and-swap API
-	accountData, err := am.LoadAccount(casefoldedAccount)
-	if err != nil {
-		return
-	} else if !accountData.Verified {
-		return newSettings, errAccountUnverified
-	}
-	newSettings, err = munger(accountData.Settings)
-	if err != nil {
-		return
-	}
-	text, err := json.Marshal(newSettings)
-	if err != nil {
-		return
-	}
-	key := fmt.Sprintf(keyAccountSettings, casefoldedAccount)
-	serializedValue := string(text)
-	err = am.server.store.Update(func(tx *buntdb.Tx) (err error) {
-		_, _, err = tx.Set(key, serializedValue, nil)
-		return
-	})
-	if err != nil {
-		err = errAccountUpdateFailed
-		return
-	}
-	// success, push new settings into the client objects
-	am.Lock()
-	defer am.Unlock()
-	for _, client := range am.accountToClients[casefoldedAccount] {
-		client.SetAccountSettings(newSettings)
-	}
-	return
-}
-
-// represents someone's status in hostserv
-type VHostInfo struct {
-	ApprovedVHost string
-	Enabled       bool
-}
-
-// callback type implementing the actual business logic of vhost operations
-type vhostMunger func(input VHostInfo) (output VHostInfo, err error)
-
-func (am *AccountManager) VHostSet(account string, vhost string) (result VHostInfo, err error) {
-	munger := func(input VHostInfo) (output VHostInfo, err error) {
-		output = input
-		output.Enabled = true
-		output.ApprovedVHost = vhost
-		return
-	}
-
-	return am.performVHostChange(account, munger)
-}
-
-func (am *AccountManager) VHostSetEnabled(client *Client, enabled bool) (result VHostInfo, err error) {
-	munger := func(input VHostInfo) (output VHostInfo, err error) {
-		if input.ApprovedVHost == "" {
-			err = errNoVhost
-			return
-		}
-		output = input
-		output.Enabled = enabled
-		return
-	}
-
-	return am.performVHostChange(client.Account(), munger)
-}
-
-func (am *AccountManager) performVHostChange(account string, munger vhostMunger) (result VHostInfo, err error) {
-	account, err = CasefoldName(account)
-	if err != nil || account == "" {
-		err = errAccountDoesNotExist
-		return
-	}
-
-	if am.server.Defcon() <= 3 {
-		err = errFeatureDisabled
-		return
-	}
-
-	clientAccount, err := am.LoadAccount(account)
-	if err != nil {
-		err = errAccountDoesNotExist
-		return
-	} else if !clientAccount.Verified {
-		err = errAccountUnverified
-		return
-	}
-
-	result, err = munger(clientAccount.VHost)
-	if err != nil {
-		return
-	}
-
-	vhtext, err := json.Marshal(result)
-	if err != nil {
-		err = errAccountUpdateFailed
-		return
-	}
-	vhstr := string(vhtext)
-
-	key := fmt.Sprintf(keyAccountVHost, account)
-	err = am.server.store.Update(func(tx *buntdb.Tx) error {
-		_, _, err := tx.Set(key, vhstr, nil)
-		return err
-	})
-
-	if err != nil {
-		err = errAccountUpdateFailed
-		return
-	}
-
-	am.applyVhostToClients(account, result)
-	return result, nil
-}
-
-func (am *AccountManager) applyVHostInfo(client *Client, info VHostInfo) {
-	// if hostserv is disabled in config, then don't grant vhosts
-	// that were previously approved while it was enabled
-	if !am.server.Config().Accounts.VHosts.Enabled {
-		return
-	}
+func (am *AccountManager) Login(client *Client, account ClientAccount) {
+	client.Login(account)
 
 	vhost := ""
-	if info.Enabled {
-		vhost = info.ApprovedVHost
+	if account.VHost.Enabled {
+		vhost = account.VHost.ApprovedVHost
 	}
 	oldNickmask := client.NickMaskString()
 	updated := client.SetVHost(vhost)
+	
+	// Set nostr hostname if enabled and no vhost is set
+	config := am.server.Config()
+	if vhost == "" && config.Server.Cloaks.EnabledForAlwaysOn {
+		am.server.logger.Info("nostr-hostname", "Login - checking nostr hostname for account:", account.Name)
+		var cloakedHostname string
+		if config.Server.Cloaks.NostrHostnames {
+			am.server.logger.Info("nostr-hostname", "NostrHostnames enabled, computing nostr hostname")
+			cloakedHostname = am.ComputeNostrHostname(account.Name)
+		} else {
+			am.server.logger.Info("nostr-hostname", "NostrHostnames disabled in config")
+		}
+		if cloakedHostname == "" {
+			am.server.logger.Info("nostr-hostname", "No nostr hostname, using regular account cloak")
+			cloakedHostname = config.Server.Cloaks.ComputeAccountCloak(account.Name)
+		}
+		am.server.logger.Info("nostr-hostname", "Setting cloaked hostname:", cloakedHostname, "for account:", account.Name)
+		client.setCloakedHostname(cloakedHostname)
+		updated = true
+	}
+	
 	if updated && client.Registered() {
 		// TODO: doing I/O here is kind of a kludge
 		client.sendChghost(oldNickmask, client.Hostname())
 	}
-}
-
-func (am *AccountManager) applyVhostToClients(account string, result VHostInfo) {
-	am.RLock()
-	clients := am.accountToClients[account]
-	am.RUnlock()
-
-	for _, client := range clients {
-		am.applyVHostInfo(client, result)
-	}
-}
-
-func (am *AccountManager) Login(client *Client, account ClientAccount) {
-	client.Login(account)
-
-	am.applyVHostInfo(client, account.VHost)
 
 	casefoldedAccount := client.Account()
 	am.Lock()
@@ -2461,6 +2316,12 @@ type ClientAccount struct {
 	Settings        AccountSettings
 }
 
+// represents someone's status in hostserv
+type VHostInfo struct {
+	ApprovedVHost string
+	Enabled       bool
+}
+
 // convenience for passing around raw serialized account data
 type rawClientAccount struct {
 	Name            string
@@ -2471,4 +2332,221 @@ type rawClientAccount struct {
 	VHost           string
 	Settings        string
 	Suspended       string
+}
+
+// ComputeNostrHostname generates a nostr-based hostname for an account if available
+func (am *AccountManager) ComputeNostrHostname(accountName string) string {
+	config := am.server.Config()
+	am.server.logger.Info("nostr-hostname", "ComputeNostrHostname called for account:", accountName)
+	
+	if !config.Server.Cloaks.NostrHostnames {
+		am.server.logger.Info("nostr-hostname", "NostrHostnames disabled in config")
+		return ""
+	}
+	
+	nostrIdentifier := am.loadNostrIdentifier(accountName)
+	am.server.logger.Info("nostr-hostname", "Loaded nostr identifier:", nostrIdentifier, "for account:", accountName)
+	
+	if nostrIdentifier == "" {
+		am.server.logger.Info("nostr-hostname", "No nostr identifier found for account:", accountName)
+		return ""
+	}
+	
+	hostname := config.Server.Cloaks.ComputeNostrHostname(nostrIdentifier)
+	am.server.logger.Info("nostr-hostname", "Generated hostname:", hostname, "from identifier:", nostrIdentifier)
+	return hostname
+}
+
+func (am *AccountManager) AuthenticateByCertificate(client *Client, certfp string, peerCerts []*x509.Certificate, authzid string) (err error) {
+	if certfp == "" {
+		return errAccountInvalidCredentials
+	}
+
+	var clientAccount ClientAccount
+
+	defer func() {
+		if err == nil {
+			am.Login(client, clientAccount)
+		}
+	}()
+
+	config := am.server.Config()
+	if config.Accounts.AuthScript.Enabled {
+		var output AuthScriptOutput
+		output, err = CheckAuthScript(am.server.semaphores.AuthScript, config.Accounts.AuthScript.ScriptConfig,
+			AuthScriptInput{Certfp: certfp, IP: client.IP().String(), peerCerts: peerCerts})
+		if err != nil {
+			am.server.logger.Error("internal", "failed shell auth invocation", err.Error())
+		} else if output.Success && output.AccountName != "" {
+			clientAccount, err = am.loadWithAutocreation(output.AccountName, config.Accounts.AuthScript.Autocreate)
+			return
+		}
+	}
+
+	var account string
+	certFPKey := fmt.Sprintf(keyCertToAccount, certfp)
+
+	err = am.server.store.View(func(tx *buntdb.Tx) error {
+		account, _ = tx.Get(certFPKey)
+		if account == "" {
+			return errAccountInvalidCredentials
+		}
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if authzid != "" {
+		if cfAuthzid, err := CasefoldName(authzid); err != nil || cfAuthzid != account {
+			return errAuthzidAuthcidMismatch
+		}
+	}
+
+	// ok, we found an account corresponding to their certificate
+	clientAccount, err = am.LoadAccount(account)
+	return err
+}
+
+type settingsMunger func(input AccountSettings) (output AccountSettings, err error)
+
+func (am *AccountManager) ModifyAccountSettings(account string, munger settingsMunger) (newSettings AccountSettings, err error) {
+	casefoldedAccount, err := CasefoldName(account)
+	if err != nil {
+		return newSettings, errAccountDoesNotExist
+	}
+	// TODO implement this in general via a compare-and-swap API
+	accountData, err := am.LoadAccount(casefoldedAccount)
+	if err != nil {
+		return
+	} else if !accountData.Verified {
+		return newSettings, errAccountUnverified
+	}
+	newSettings, err = munger(accountData.Settings)
+	if err != nil {
+		return
+	}
+	text, err := json.Marshal(newSettings)
+	if err != nil {
+		return
+	}
+	key := fmt.Sprintf(keyAccountSettings, casefoldedAccount)
+	serializedValue := string(text)
+	err = am.server.store.Update(func(tx *buntdb.Tx) (err error) {
+		_, _, err = tx.Set(key, serializedValue, nil)
+		return
+	})
+	if err != nil {
+		err = errAccountUpdateFailed
+		return
+	}
+	// success, push new settings into the client objects
+	am.Lock()
+	defer am.Unlock()
+	for _, client := range am.accountToClients[casefoldedAccount] {
+		client.SetAccountSettings(newSettings)
+	}
+	return
+}
+
+// callback type implementing the actual business logic of vhost operations
+type vhostMunger func(input VHostInfo) (output VHostInfo, err error)
+
+func (am *AccountManager) VHostSet(account string, vhost string) (result VHostInfo, err error) {
+	munger := func(input VHostInfo) (output VHostInfo, err error) {
+		output = input
+		output.Enabled = true
+		output.ApprovedVHost = vhost
+		return
+	}
+
+	return am.performVHostChange(account, munger)
+}
+
+func (am *AccountManager) VHostSetEnabled(client *Client, enabled bool) (result VHostInfo, err error) {
+	munger := func(input VHostInfo) (output VHostInfo, err error) {
+		if input.ApprovedVHost == "" {
+			err = errNoVhost
+			return
+		}
+		output = input
+		output.Enabled = enabled
+		return
+	}
+
+	return am.performVHostChange(client.Account(), munger)
+}
+
+func (am *AccountManager) performVHostChange(account string, munger vhostMunger) (result VHostInfo, err error) {
+	account, err = CasefoldName(account)
+	if err != nil || account == "" {
+		err = errAccountDoesNotExist
+		return
+	}
+
+	if am.server.Defcon() <= 3 {
+		err = errFeatureDisabled
+		return
+	}
+
+	clientAccount, err := am.LoadAccount(account)
+	if err != nil {
+		err = errAccountDoesNotExist
+		return
+	} else if !clientAccount.Verified {
+		err = errAccountUnverified
+		return
+	}
+
+	result, err = munger(clientAccount.VHost)
+	if err != nil {
+		return
+	}
+
+	vhtext, err := json.Marshal(result)
+	if err != nil {
+		err = errAccountUpdateFailed
+		return
+	}
+	vhstr := string(vhtext)
+
+	key := fmt.Sprintf(keyAccountVHost, account)
+	err = am.server.store.Update(func(tx *buntdb.Tx) error {
+		_, _, err = tx.Set(key, vhstr, nil)
+		return err
+	})
+
+	if err != nil {
+		err = errAccountUpdateFailed
+		return
+	}
+
+	am.applyVhostToClients(account, result)
+	return result, nil
+}
+
+func (am *AccountManager) applyVhostToClients(account string, result VHostInfo) {
+	// if hostserv is disabled in config, then don't grant vhosts
+	// that were previously approved while it was enabled
+	if !am.server.Config().Accounts.VHosts.Enabled {
+		return
+	}
+
+	vhost := ""
+	if result.Enabled {
+		vhost = result.ApprovedVHost
+	}
+	am.RLock()
+	clients := am.accountToClients[account]
+	am.RUnlock()
+
+	for _, client := range clients {
+		oldNickmask := client.NickMaskString()
+		updated := client.SetVHost(vhost)
+		if updated && client.Registered() {
+			// TODO: doing I/O here is kind of a kludge
+			client.sendChghost(oldNickmask, client.Hostname())
+		}
+	}
 }

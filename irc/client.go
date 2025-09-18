@@ -436,7 +436,19 @@ func (server *Server) AddAlwaysOnClient(account ClientAccount, channelToStatus m
 
 	rawHostname, cloakedHostname := server.name, ""
 	if config.Server.Cloaks.EnabledForAlwaysOn {
-		cloakedHostname = config.Server.Cloaks.ComputeAccountCloak(account.Name)
+		// Try nostr hostname first, fallback to regular account cloak
+		server.logger.Info("nostr-hostname", "AddAlwaysOnClient - checking nostr hostname for account:", account.Name)
+		if config.Server.Cloaks.NostrHostnames {
+			server.logger.Info("nostr-hostname", "NostrHostnames enabled, computing nostr hostname")
+			cloakedHostname = server.accounts.ComputeNostrHostname(account.Name)
+		} else {
+			server.logger.Info("nostr-hostname", "NostrHostnames disabled in config")
+		}
+		if cloakedHostname == "" {
+			server.logger.Info("nostr-hostname", "No nostr hostname, using regular account cloak")
+			cloakedHostname = config.Server.Cloaks.ComputeAccountCloak(account.Name)
+		}
+		server.logger.Info("nostr-hostname", "Setting cloaked hostname:", cloakedHostname, "for always-on account:", account.Name)
 	}
 
 	username := "~u"

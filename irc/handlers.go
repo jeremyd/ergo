@@ -32,6 +32,7 @@ import (
 	"github.com/ergochat/ergo/irc/history"
 	"github.com/ergochat/ergo/irc/jwt"
 	"github.com/ergochat/ergo/irc/modes"
+	"github.com/ergochat/ergo/irc/nostr"
 	"github.com/ergochat/ergo/irc/oauth2"
 	"github.com/ergochat/ergo/irc/sno"
 	"github.com/ergochat/ergo/irc/utils"
@@ -42,25 +43,42 @@ import (
 func parseCallback(spec string, config *Config) (callbackNamespace string, callbackValue string, err error) {
 	// XXX if we don't require verification, ignore any callback that was passed here
 	// (to avoid confusion in the case where the ircd has no mail server configured)
-	if !config.Accounts.Registration.EmailVerification.Enabled {
+	if !config.Accounts.Registration.EmailVerification.Enabled && !config.Accounts.Registration.NostrVerification.Enabled {
 		callbackNamespace = "*"
 		return
 	}
-	callback := strings.ToLower(spec)
-	if colonIndex := strings.IndexByte(callback, ':'); colonIndex != -1 {
-		callbackNamespace, callbackValue = callback[:colonIndex], callback[colonIndex+1:]
+	if colonIndex := strings.IndexByte(spec, ':'); colonIndex != -1 {
+		callbackNamespace, callbackValue = strings.ToLower(spec[:colonIndex]), spec[colonIndex+1:]
 	} else {
-		// "If a callback namespace is not ... provided, the IRC server MUST use mailto""
-		callbackNamespace = "mailto"
-		callbackValue = callback
+		// Auto-detect callback type based on format
+		if nostr.IsNostrIdentifier(spec) {
+			callbackNamespace = "nostr"
+			callbackValue = spec
+		} else {
+			// "If a callback namespace is not ... provided, the IRC server MUST use mailto""
+			callbackNamespace = "mailto"
+			callbackValue = strings.ToLower(spec)
+		}
 	}
 
-	if config.Accounts.Registration.EmailVerification.Enabled {
-		if callbackNamespace != "mailto" {
-			err = errValidEmailRequired
-		} else if strings.IndexByte(callbackValue, '@') < 1 {
-			err = errValidEmailRequired
+	if callbackNamespace == "mailto" {
+		if config.Accounts.Registration.EmailVerification.Enabled {
+			if strings.IndexByte(callbackValue, '@') < 1 {
+				err = errValidEmailRequired
+			}
+		} else {
+			err = errUnsupportedCallbackNamespace
 		}
+	} else if callbackNamespace == "nostr" {
+		if config.Accounts.Registration.NostrVerification.Enabled {
+			if !nostr.IsValidNostrIdentifier(callbackValue) {
+				err = errValidNostrIdentifierRequired
+			}
+		} else {
+			err = errUnsupportedCallbackNamespace
+		}
+	} else if callbackNamespace != "admin" && callbackNamespace != "none" && callbackNamespace != "*" {
+		err = errUnsupportedCallbackNamespace
 	}
 
 	return
@@ -131,7 +149,20 @@ func sendSuccessfulAccountAuth(service *ircService, client *Client, rb *Response
 	if rb.session.isTor {
 		config := client.server.Config()
 		if config.Server.Cloaks.EnabledForAlwaysOn {
-			cloakedHostname := config.Server.Cloaks.ComputeAccountCloak(details.accountName)
+			// Try nostr hostname first, fallback to regular account cloak
+			var cloakedHostname string
+			client.server.logger.Info("nostr-hostname", "Authentication success - checking nostr hostname for account:", details.accountName)
+			if config.Server.Cloaks.NostrHostnames {
+				client.server.logger.Info("nostr-hostname", "NostrHostnames enabled, computing nostr hostname")
+				cloakedHostname = client.server.accounts.ComputeNostrHostname(details.accountName)
+			} else {
+				client.server.logger.Info("nostr-hostname", "NostrHostnames disabled in config")
+			}
+			if cloakedHostname == "" {
+				client.server.logger.Info("nostr-hostname", "No nostr hostname, using regular account cloak")
+				cloakedHostname = config.Server.Cloaks.ComputeAccountCloak(details.accountName)
+			}
+			client.server.logger.Info("nostr-hostname", "Setting cloaked hostname:", cloakedHostname, "for account:", details.accountName)
 			client.setCloakedHostname(cloakedHostname)
 			if client.registered {
 				client.sendChghost(details.nickMask, client.Hostname())
@@ -216,7 +247,7 @@ func authenticateHandler(server *Server, client *Client, msg ircmsg.Message, rb 
 		// and I don't want to break working clients that use PLAIN or EXTERNAL
 		// and violate this MUST (e.g. by sending CAP END too early).
 		if client.registered && !(mechanism == "PLAIN" || mechanism == "EXTERNAL") {
-			rb.Add(nil, server.name, ERR_SASLFAIL, details.nick, client.t("SASL is only allowed before connection registration"))
+			rb.Add(nil, server.name, ERR_SASLFAIL, client.Nick(), client.t("SASL is only allowed before connection registration"))
 			return false
 		}
 
@@ -275,12 +306,12 @@ func authPlainHandler(server *Server, client *Client, session *Session, value []
 	if len(splitValue) == 3 {
 		authzid, authcid = string(splitValue[0]), string(splitValue[1])
 
-		if authzid != "" && authcid != authzid {
-			rb.Add(nil, server.name, ERR_SASLFAIL, client.Nick(), client.t("SASL authentication failed: authcid and authzid should be the same"))
+		if authzid != "" && authzid != authcid {
+			rb.Add(nil, server.name, ERR_SASLFAIL, client.nick, client.t("SASL authentication failed: authcid and authzid should be the same"))
 			return false
 		}
 	} else {
-		rb.Add(nil, server.name, ERR_SASLFAIL, client.Nick(), client.t("SASL authentication failed: Invalid auth blob"))
+		rb.Add(nil, server.name, ERR_SASLFAIL, client.nick, client.t("SASL authentication failed: Invalid auth blob"))
 		return false
 	}
 
@@ -979,7 +1010,7 @@ func dlineHandler(server *Server, client *Client, msg ircmsg.Message, rb *Respon
 	// check oper permissions
 	oper := client.Oper()
 	if !oper.HasRoleCapab("ban") {
-		rb.Add(nil, server.name, ERR_NOPRIVS, client.nick, msg.Command, client.t("Insufficient oper privs"))
+		rb.Add(nil, server.name, ERR_NOPRIVS, client.Nick(), msg.Command, client.t("Insufficient oper privs"))
 		return false
 	}
 
@@ -1024,10 +1055,6 @@ func dlineHandler(server *Server, client *Client, msg ircmsg.Message, rb *Respon
 	}
 
 	// get host
-	if len(msg.Params) < currentArg+1 {
-		rb.Add(nil, server.name, ERR_NEEDMOREPARAMS, client.nick, msg.Command, client.t("Not enough parameters"))
-		return false
-	}
 	hostString := msg.Params[currentArg]
 	currentArg++
 
@@ -1367,6 +1394,10 @@ func joinHandler(server *Server, client *Client, msg ircmsg.Message, rb *Respons
 		if len(keys) > i {
 			key = keys[i]
 		}
+
+		// Check if this is a nostr feed channel
+		// (nostr relay feeds removed)
+
 		err, forward := server.channels.Join(client, name, key, false, rb)
 		if err != nil {
 			if forward != "" {
@@ -1529,7 +1560,7 @@ func killHandler(server *Server, client *Client, msg ircmsg.Message, rb *Respons
 		rb.Add(nil, client.server.name, ERR_NOSUCHNICK, client.Nick(), utils.SafeErrorParam(nickname), client.t("No such nick"))
 		return false
 	} else if target.AlwaysOn() {
-		rb.Add(nil, client.server.name, ERR_UNKNOWNERROR, client.Nick(), "KILL", fmt.Sprintf(client.t("Client %s is always-on and cannot be fully removed by /KILL; consider /UBAN ADD instead"), target.Nick()))
+		rb.Add(nil, client.server.name, ERR_UNKNOWNERROR, client.Nick(), client.t("Client %s is always-on and cannot be fully removed by /KILL; consider /UBAN ADD instead"), target.Nick())
 	}
 
 	quitMsg := "Killed"
@@ -1812,6 +1843,8 @@ func listHandler(server *Server, client *Client, msg ircmsg.Message, rb *Respons
 				rplList(channel)
 			}
 		}
+		
+		// (nostr relay feeds removed)
 	} else {
 		// limit regular users to only listing one channel
 		if !clientIsOp {
@@ -2224,7 +2257,7 @@ func absorbBatchedMessage(server *Server, client *Client, msg ircmsg.Message, ba
 	var failParams []string
 	defer func() {
 		if failParams != nil {
-			if histType != history.Notice {
+			if histType != history.Privmsg {
 				params := make([]string, 1+len(failParams))
 				params[0] = "BATCH"
 				copy(params[1:], failParams)
@@ -2342,6 +2375,8 @@ func dispatchMessageToTarget(client *Client, tags map[string]string, histType hi
 	if len(target) == 0 {
 		return
 	} else if target[0] == '#' {
+		// (nostr relay feeds removed)
+
 		channel := server.channels.Get(target)
 		if channel == nil {
 			if histType != history.Notice {
@@ -2367,7 +2402,7 @@ func dispatchMessageToTarget(client *Client, tags map[string]string, histType hi
 
 				tnick := tClient.Nick()
 				for _, session := range tClient.Sessions() {
-					session.sendSplitMsgFromClientInternal(false, nickMaskString, accountName, isBot, nil, command, tnick, message)
+					session.sendFromClientInternal(false, time.Time{}, "", nickMaskString, accountName, isBot, tags, command, tnick)
 				}
 			}
 		}
@@ -2484,7 +2519,7 @@ func dispatchMessageToTarget(client *Client, tags map[string]string, histType hi
 					time:     message.Time,
 				})
 			} else {
-				server.logger.Error("internal", "can't serialize push message", err.Error())
+				server.logger.Error("internal", "couldn't serialize push message", err.Error())
 			}
 		}
 	}
@@ -2541,7 +2576,7 @@ func npcaHandler(server *Server, client *Client, msg ircmsg.Message, rb *Respons
 // OPER <name> [password]
 func operHandler(server *Server, client *Client, msg ircmsg.Message, rb *ResponseBuffer) bool {
 	if client.HasMode(modes.Operator) {
-		rb.Add(nil, server.name, ERR_UNKNOWNERROR, client.Nick(), "OPER", client.t("You're already opered-up!"))
+		rb.Add(nil, server.name, ERR_UNKNOWNERROR, client.Nick(), client.t("You're already opered-up!"))
 		return false
 	}
 
@@ -2666,6 +2701,9 @@ func partHandler(server *Server, client *Client, msg ircmsg.Message, rb *Respons
 		if chname == "" {
 			continue // #679
 		}
+
+		// (nostr relay feeds removed)
+
 		err := server.channels.Part(client, chname, reason, rb)
 		if err == errNoSuchChannel {
 			rb.Add(nil, server.name, ERR_NOSUCHCHANNEL, client.nick, utils.SafeErrorParam(chname), client.t("No such channel"))
@@ -2801,6 +2839,7 @@ func redactHandler(server *Server, client *Client, msg ircmsg.Message, rb *Respo
 	isBot := client.HasMode(modes.Bot)
 
 	if target[0] == '#' {
+		// (nostr relay feeds removed)
 		channel := server.channels.Get(target)
 		if channel == nil {
 			rb.Add(nil, server.name, ERR_NOSUCHCHANNEL, client.Nick(), utils.SafeErrorParam(target), client.t("No such channel"))
@@ -2852,7 +2891,7 @@ func redactHandler(server *Server, client *Client, msg ircmsg.Message, rb *Respo
 
 		if err != nil {
 			client.server.logger.Error("internal", fmt.Sprintf("Private message %s is not deletable by %s from their own buffer's even though we just deleted it from %s's. This is a bug, please report it in details.", targetmsgid, client.Nick(), target), client.Nick())
-			isOper := client.HasRoleCapabs("history")
+			isOper := client.HasMode(modes.Operator)
 			if isOper {
 				rb.Add(nil, server.name, "FAIL", "REDACT", "REDACT_FORBIDDEN", utils.SafeErrorParam(target), utils.SafeErrorParam(targetmsgid), fmt.Sprintf(client.t("Error deleting message: %v"), err))
 			} else {
@@ -3232,8 +3271,8 @@ func metadataRegisteredHandler(client *Client, config *Config, subcommand string
 			return
 		}
 
-		batchId := rb.StartNestedBatch("metadata", target)
-		defer rb.EndNestedBatch(batchId)
+		batchID := rb.StartNestedBatch("metadata", target)
+		defer rb.EndNestedBatch(batchID)
 
 		for _, key := range params[2:] {
 			if metadataKeyIsEvil(key) {
@@ -3255,11 +3294,6 @@ func metadataRegisteredHandler(client *Client, config *Config, subcommand string
 		playMetadataList(rb, client.Nick(), target, targetObj.ListMetadata())
 
 	case "clear":
-		if !metadataCanIEditThisTarget(client, targetObj) {
-			noKeyPerms("*")
-			return
-		}
-
 		values := targetObj.ClearMetadata()
 
 		playMetadataList(rb, client.Nick(), target, values)
@@ -4240,7 +4274,7 @@ func whoHandler(server *Server, client *Client, msg ircmsg.Message, rb *Response
 
 	// successfully parsed query, ensure we send the success response:
 	defer func() {
-		rb.Add(nil, server.name, RPL_ENDOFWHO, client.Nick(), origMask, client.t("End of WHO list"))
+		rb.Add(nil, server.name, RPL_ENDOFWHO, client.Nick(), origMask, client.t("End of /WHO list"))
 	}()
 
 	// XXX #1730: https://datatracker.ietf.org/doc/html/rfc1459#section-4.5.1
@@ -4309,67 +4343,6 @@ func whoHandler(server *Server, client *Client, msg ircmsg.Message, rb *Response
 		}
 	}
 
-	return false
-}
-
-// WHOIS [<target>] <mask>{,<mask>}
-func whoisHandler(server *Server, client *Client, msg ircmsg.Message, rb *ResponseBuffer) bool {
-	var masksString string
-	//var target string
-
-	if len(msg.Params) > 1 {
-		//target = msg.Params[0]
-		masksString = msg.Params[1]
-	} else {
-		masksString = msg.Params[0]
-	}
-
-	handleService := func(nick string) bool {
-		cfnick, _ := CasefoldName(nick)
-		service, ok := ErgoServices[cfnick]
-		hostname := "localhost"
-		config := server.Config()
-		if config.Server.OverrideServicesHostname != "" {
-			hostname = config.Server.OverrideServicesHostname
-		}
-		if !ok {
-			return false
-		}
-		clientNick := client.Nick()
-		rb.Add(nil, client.server.name, RPL_WHOISUSER, clientNick, service.Name, service.Name, hostname, "*", service.Realname(client))
-		// #1080:
-		rb.Add(nil, client.server.name, RPL_WHOISOPERATOR, clientNick, service.Name, client.t("is a network service"))
-		// hehe
-		if client.HasMode(modes.TLS) {
-			rb.Add(nil, client.server.name, RPL_WHOISSECURE, clientNick, service.Name, client.t("is using a secure connection"))
-		}
-		return true
-	}
-
-	hasPrivs := client.HasRoleCapabs("samode")
-	if hasPrivs {
-		for _, mask := range strings.Split(masksString, ",") {
-			matches := server.clients.FindAll(mask)
-			if len(matches) == 0 && !handleService(mask) {
-				rb.Add(nil, client.server.name, ERR_NOSUCHNICK, client.Nick(), utils.SafeErrorParam(mask), client.t("No such nick"))
-				continue
-			}
-			for mclient := range matches {
-				client.getWhoisOf(mclient, hasPrivs, rb)
-			}
-		}
-	} else {
-		// only get the first request; also require a nick, not a mask
-		nick := strings.Split(masksString, ",")[0]
-		mclient := server.clients.Get(nick)
-		if mclient != nil {
-			client.getWhoisOf(mclient, hasPrivs, rb)
-		} else if !handleService(nick) {
-			rb.Add(nil, client.server.name, ERR_NOSUCHNICK, client.Nick(), utils.SafeErrorParam(masksString), client.t("No such nick"))
-		}
-		// fall through, ENDOFWHOIS is always sent
-	}
-	rb.Add(nil, server.name, RPL_ENDOFWHOIS, client.nick, utils.SafeErrorParam(masksString), client.t("End of /WHOIS list"))
 	return false
 }
 

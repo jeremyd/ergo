@@ -5,9 +5,11 @@ package cloaks
 import (
 	"fmt"
 	"net"
+	"strings"
 
 	"crypto/sha3"
 
+	"github.com/ergochat/ergo/irc/nostr"
 	"github.com/ergochat/ergo/irc/utils"
 )
 
@@ -19,6 +21,7 @@ type CloakConfig struct {
 	CidrLenIPv6        int    `yaml:"cidr-len-ipv6"`
 	NumBits            int    `yaml:"num-bits"`
 	LegacySecretValue  string `yaml:"secret"`
+	NostrHostnames     bool   `yaml:"nostr-hostnames"` // enable nostr-based hostnames for accounts registered with nostr
 
 	secret   string
 	numBytes int
@@ -92,4 +95,55 @@ func (config *CloakConfig) ComputeAccountCloak(accountName string) string {
 	paddedAccountName := make([]byte, 16+len(accountName))
 	copy(paddedAccountName[16:], accountName[:])
 	return config.macAndCompose(paddedAccountName)
+}
+
+// ComputeNostrHostname generates a readable hostname from a nostr identifier
+func (config *CloakConfig) ComputeNostrHostname(nostrIdentifier string) string {
+	fmt.Printf("DEBUG: ComputeNostrHostname called with identifier: '%s'\n", nostrIdentifier)
+	
+	if nostrIdentifier == "" {
+		fmt.Printf("DEBUG: Empty nostr identifier, returning netname: %s\n", config.Netname)
+		return config.Netname
+	}
+
+	// Handle NIP-05 addresses (alice@example.com -> alice@example.com)
+	if strings.Contains(nostrIdentifier, "@") {
+		parts := strings.SplitN(nostrIdentifier, "@", 2)
+		if len(parts) == 2 {
+			// Return the full NIP-05 address as the hostname
+			hostname := nostrIdentifier
+			fmt.Printf("DEBUG: NIP-05 hostname generated: %s\n", hostname)
+			return hostname
+		}
+	}
+
+	// Handle npub format (npub1abc123... -> npub1abc123....nostr)
+	if strings.HasPrefix(nostrIdentifier, "npub1") {
+		// Use the full npub as hostname
+		hostname := fmt.Sprintf("%s.nostr", nostrIdentifier)
+		fmt.Printf("DEBUG: npub hostname generated: %s\n", hostname)
+		return hostname
+	}
+
+	// Handle hex pubkey (3bf0c63f... -> convert to npub and use full npub.nostr)
+	if len(nostrIdentifier) == 64 {
+		// Convert hex pubkey to npub format
+		npub, err := nostr.HexToNpub(nostrIdentifier)
+		if err != nil {
+			fmt.Printf("DEBUG: Failed to convert hex to npub: %v, using fallback\n", err)
+			// Fallback to truncated hex if conversion fails
+			truncated := nostrIdentifier[:8]
+			hostname := fmt.Sprintf("%s.nostr", truncated)
+			fmt.Printf("DEBUG: hex pubkey fallback hostname generated: %s\n", hostname)
+			return hostname
+		}
+		hostname := fmt.Sprintf("%s.nostr", npub)
+		fmt.Printf("DEBUG: hex pubkey converted to npub hostname: %s\n", hostname)
+		return hostname
+	}
+
+	// Fallback to regular account cloak
+	fallback := config.ComputeAccountCloak(nostrIdentifier)
+	fmt.Printf("DEBUG: Using fallback account cloak: %s\n", fallback)
+	return fallback
 }

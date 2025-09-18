@@ -399,7 +399,7 @@ func init() {
 			minParams: 1,
 		},
 		"WHOIS": {
-			handler:   whoisHandler,
+			handler:   whoHandler,
 			minParams: 1,
 		},
 		"WHOWAS": {

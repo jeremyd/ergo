@@ -369,6 +369,13 @@ type AccountRegistrationConfig struct {
 	Throttling         ThrottleConfig
 	// new-style (v2.4 email verification config):
 	EmailVerification email.MailtoConfig `yaml:"email-verification"`
+	// nostr-based account verification, where we send a DM with verification code
+	NostrVerification struct {
+		Enabled       bool          `yaml:"enabled"`
+		PrivateKey    string        `yaml:"private-key"`
+		DefaultRelays []string      `yaml:"default-relays"`
+		Timeout       time.Duration `yaml:"timeout"`
+	} `yaml:"nostr-verification"`
 	// old-style email verification config, with "callbacks":
 	LegacyEnabledCallbacks []string `yaml:"enabled-callbacks"`
 	LegacyCallbacks        struct {
@@ -664,6 +671,14 @@ type Config struct {
 	}
 
 	Accounts AccountConfig
+
+	NostrVerification struct {
+		Enabled       bool          `yaml:"enabled"`
+		PrivateKey    string        `yaml:"private-key"`
+		DefaultRelays []string      `yaml:"default-relays"`
+		Timeout       time.Duration `yaml:"timeout"`
+	}
+
 
 	Channels struct {
 		DefaultModes         *string `yaml:"default-modes"`
@@ -1973,4 +1988,15 @@ func normalizeCommandAliases(aliases map[string]string) (normalizedAliases map[s
 		normalizedAliases[alias] = command
 	}
 	return normalizedAliases, nil
+}
+
+type CloakConfig struct {
+	Enabled            bool   `yaml:"enabled"`
+	EnabledForAlwaysOn bool   `yaml:"enabled-for-always-on"`
+	Netname            string `yaml:"netname"`
+	CidrLenIPv4        int    `yaml:"cidr-len-ipv4"`
+	CidrLenIPv6        int    `yaml:"cidr-len-ipv6"`
+	NumBits            int    `yaml:"num-bits"`
+	SecretValue        string `yaml:"secret"`
+	NostrHostnames     bool   `yaml:"nostr-hostnames"` // enable nostr-based hostnames for accounts registered with nostr
 }

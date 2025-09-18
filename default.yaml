@@ -360,6 +360,10 @@ server:
         # all users will receive simply `netname` as their cloaked hostname.
         num-bits: 64
 
+        # enable nostr-based hostnames for accounts registered with nostr verification
+        # (e.g., alice@example.com -> alice.example.com, npub1abc123... -> npub1abc123.nostr)
+        nostr-hostnames: true
+
     # secure-nets identifies IPs and CIDRs which are secure at layer 3,
     # for example, because they are on a trusted internal LAN or a VPN.
     # plaintext connections from these IPs and CIDRs will be considered
@@ -470,6 +474,19 @@ accounts:
                 cooldown: 1h
                 # time for which a password reset code is valid
                 timeout: 1d
+
+        # options for nostr-based verification of account registrations
+        nostr-verification:
+            enabled: true
+            # hex-encoded private key for signing DMs (generate with: openssl rand -hex 32)
+            private-key: ""
+            # default relays to use for sending DMs and relay discovery
+            default-relays:
+                - "wss://relay.damus.io"
+                - "wss://nos.lol"
+                - "wss://profiles.nostr1.com"
+            # timeout for nostr operations (NIP-05 resolution, relay connections)
+            timeout: 30s
 
     # throttle account login attempts (to prevent either password guessing, or DoS
     # attacks on the server aimed at forcing repeated expensive bcrypt computations)

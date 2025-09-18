@@ -103,6 +103,7 @@ type Server struct {
 	apiHandler  http.Handler // always initialized
 	apiListener *utils.ReloadableListener
 	apiServer   *http.Server // nil if API is not enabled
+
 }
 
 // NewServer returns a new Oragono server.
@@ -135,6 +136,7 @@ func NewServer(config *Config, logger *logger.Manager) (*Server, error) {
 		return nil, err
 	}
 
+
 	// Attempt to clean up when receiving these signals.
 	signal.Notify(server.exitSignals, utils.ServerExitSignals...)
 	signal.Notify(server.rehashSignal, syscall.SIGHUP)
@@ -160,6 +162,7 @@ func (server *Server) Shutdown() {
 
 	// flush data associated with always-on clients:
 	server.performAlwaysOnMaintenance(false, true)
+
 
 	if err := server.store.Close(); err != nil {
 		server.logger.Error("shutdown", fmt.Sprintln("Could not close datastore:", err))

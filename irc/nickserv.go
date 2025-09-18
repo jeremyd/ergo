@@ -135,11 +135,18 @@ INFO gives you information about the given (or your own) user account.`,
 			handler: nsRegisterHandler,
 			// TODO: "email" is an oversimplification here; it's actually any callback, e.g.,
 			// person@example.com, mailto:person@example.com, tel:16505551234.
-			help: `Syntax: $bREGISTER <password> [email]$b
+			help: `Syntax: $bREGISTER <password> [nostr-identifier]$b
 
-REGISTER lets you register your current nickname as a user account. If the
-server allows anonymous registration, you can omit the e-mail address.
+REGISTER lets you register your current nickname as a user account using nostr
+verification. You can provide a nostr identifier in one of these formats:
 
+• NIP-05 address: alice@example.com
+• npub key: npub1abc123def456...
+• hex pubkey: 3bf0c63fcb93c5ef2f068d70b8d70d963b649d75...
+
+The server will contact you via Nostr DM (nip17 or nip04) with verification code.
+
+If the server allows anonymous registration, you can omit the nostr identifier.
 If you are currently logged in with a TLS client certificate and wish to use
 it instead of a password to log in, send * as the password.`,
 			helpShort: `$bREGISTER$b lets you register a user account.`,
@@ -1016,7 +1023,7 @@ func nsRegisterHandler(service *ircService, server *Server, client *Client, comm
 
 	callbackNamespace, callbackValue, validationErr := parseCallback(email, config)
 	if validationErr != nil {
-		service.Notice(rb, client.t("Registration requires a valid e-mail address"))
+		service.Notice(rb, client.t("Registration invalid, see help"))
 		return
 	}
 
