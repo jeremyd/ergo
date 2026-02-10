@@ -1843,7 +1843,7 @@ func listHandler(server *Server, client *Client, msg ircmsg.Message, rb *Respons
 				rplList(channel)
 			}
 		}
-		
+
 		// (nostr relay feeds removed)
 	} else {
 		// limit regular users to only listing one channel
@@ -4343,6 +4343,67 @@ func whoHandler(server *Server, client *Client, msg ircmsg.Message, rb *Response
 		}
 	}
 
+	return false
+}
+
+// WHOIS [<target>] <mask>{,<mask>}
+func whoisHandler(server *Server, client *Client, msg ircmsg.Message, rb *ResponseBuffer) bool {
+	var masksString string
+	//var target string
+
+	if len(msg.Params) > 1 {
+		//target = msg.Params[0]
+		masksString = msg.Params[1]
+	} else {
+		masksString = msg.Params[0]
+	}
+
+	handleService := func(nick string) bool {
+		cfnick, _ := CasefoldName(nick)
+		service, ok := ErgoServices[cfnick]
+		hostname := "localhost"
+		config := server.Config()
+		if config.Server.OverrideServicesHostname != "" {
+			hostname = config.Server.OverrideServicesHostname
+		}
+		if !ok {
+			return false
+		}
+		clientNick := client.Nick()
+		rb.Add(nil, client.server.name, RPL_WHOISUSER, clientNick, service.Name, service.Name, hostname, "*", service.Realname(client))
+		// #1080:
+		rb.Add(nil, client.server.name, RPL_WHOISOPERATOR, clientNick, service.Name, client.t("is a network service"))
+		// hehe
+		if client.HasMode(modes.TLS) {
+			rb.Add(nil, client.server.name, RPL_WHOISSECURE, clientNick, service.Name, client.t("is using a secure connection"))
+		}
+		return true
+	}
+
+	hasPrivs := client.HasRoleCapabs("samode")
+	if hasPrivs {
+		for _, mask := range strings.Split(masksString, ",") {
+			matches := server.clients.FindAll(mask)
+			if len(matches) == 0 && !handleService(mask) {
+				rb.Add(nil, client.server.name, ERR_NOSUCHNICK, client.Nick(), utils.SafeErrorParam(mask), client.t("No such nick"))
+				continue
+			}
+			for mclient := range matches {
+				client.getWhoisOf(mclient, hasPrivs, rb)
+			}
+		}
+	} else {
+		// only get the first request; also require a nick, not a mask
+		nick := strings.Split(masksString, ",")[0]
+		mclient := server.clients.Get(nick)
+		if mclient != nil {
+			client.getWhoisOf(mclient, hasPrivs, rb)
+		} else if !handleService(nick) {
+			rb.Add(nil, client.server.name, ERR_NOSUCHNICK, client.Nick(), utils.SafeErrorParam(masksString), client.t("No such nick"))
+		}
+		// fall through, ENDOFWHOIS is always sent
+	}
+	rb.Add(nil, server.name, RPL_ENDOFWHOIS, client.nick, utils.SafeErrorParam(masksString), client.t("End of /WHOIS list"))
 	return false
 }
 
