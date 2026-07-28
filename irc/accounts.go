@@ -25,6 +25,7 @@ import (
 	"github.com/ergochat/ergo/irc/email"
 	"github.com/ergochat/ergo/irc/migrations"
 	"github.com/ergochat/ergo/irc/modes"
+	"github.com/ergochat/ergo/irc/nostr"
 	"github.com/ergochat/ergo/irc/oauth2"
 	"github.com/ergochat/ergo/irc/passwd"
 	"github.com/ergochat/ergo/irc/utils"
@@ -54,6 +55,7 @@ const (
 	keyAccountChannelToModes    = "account.channeltomodes %s"
 	keyAccountPushSubscriptions = "account.pushsubscriptions %s"
 	keyAccountMetadata          = "account.metadata %s"
+	keyAccountNostrIdentifier   = "account.nostridentifier %s" // stores the nostr identifier used during registration
 
 	maxCertfpsPerAccount = 5
 )
@@ -865,9 +867,72 @@ func (am *AccountManager) dispatchCallback(client *Client, account string, callb
 		return "", nil
 	} else if callbackNamespace == "mailto" {
 		return am.dispatchMailtoCallback(client, account, callbackValue)
+	} else if callbackNamespace == "nostr" {
+		return am.dispatchNostrCallback(client, account, callbackValue)
 	} else {
 		return "", fmt.Errorf("Callback not implemented: %s", callbackNamespace)
 	}
+}
+
+func (am *AccountManager) dispatchNostrCallback(_ *Client, account string, callbackValue string) (code string, err error) {
+	config := am.server.Config().Accounts.Registration.NostrVerification
+	if !config.Enabled {
+		return "", fmt.Errorf("Nostr verification is not enabled")
+	}
+
+	code = utils.GenerateSecretToken()
+
+	// Create DM config from server config
+	dmConfig := nostr.DMConfig{
+		PrivateKey:    config.PrivateKey,
+		DefaultRelays: config.DefaultRelays,
+		Timeout:       time.Duration(config.Timeout),
+		UserAgent:     fmt.Sprintf("Ergo IRC Server %s", am.server.Config().Server.Name),
+	}
+
+	// Send the verification DM
+	err = nostr.SendVerificationDM(callbackValue, account, code, am.server.Config().Server.Name, dmConfig)
+	if err != nil {
+		am.server.logger.Error("internal", "Failed to dispatch nostr DM to", callbackValue, err.Error())
+		return "", err
+	}
+
+	// Save the nostr identifier for hostname generation
+	am.saveNostrIdentifier(account, callbackValue)
+
+	return code, nil
+}
+
+func (am *AccountManager) saveNostrIdentifier(account string, nostrIdentifier string) {
+	key := fmt.Sprintf(keyAccountNostrIdentifier, account)
+	am.server.store.Update(func(tx *buntdb.Tx) error {
+		tx.Set(key, nostrIdentifier, nil)
+		return nil
+	})
+}
+
+func (am *AccountManager) loadNostrIdentifier(account string) (nostrIdentifier string) {
+	key := fmt.Sprintf(keyAccountNostrIdentifier, account)
+	am.server.store.View(func(tx *buntdb.Tx) error {
+		nostrIdentifier, _ = tx.Get(key)
+		return nil
+	})
+	return
+}
+
+// ComputeNostrHostname generates a nostr-based hostname for an account if available
+func (am *AccountManager) ComputeNostrHostname(accountName string) string {
+	config := am.server.Config()
+	if !config.Server.Cloaks.NostrHostnames {
+		return ""
+	}
+
+	nostrIdentifier := am.loadNostrIdentifier(accountName)
+	if nostrIdentifier == "" {
+		return ""
+	}
+
+	return config.Server.Cloaks.ComputeNostrHostname(nostrIdentifier)
 }
 
 func (am *AccountManager) dispatchMailtoCallback(client *Client, account string, callbackValue string) (code string, err error) {
@@ -1918,6 +1983,7 @@ func (am *AccountManager) Unregister(account string, erase bool) error {
 	emailChangeKey := fmt.Sprintf(keyAccountEmailChange, casefoldedAccount)
 	pushSubscriptionsKey := fmt.Sprintf(keyAccountPushSubscriptions, casefoldedAccount)
 	metadataKey := fmt.Sprintf(keyAccountMetadata, casefoldedAccount)
+	nostrIdentifierKey := fmt.Sprintf(keyAccountNostrIdentifier, casefoldedAccount)
 
 	var clients []*Client
 	defer func() {
@@ -1978,6 +2044,7 @@ func (am *AccountManager) Unregister(account string, erase bool) error {
 		tx.Delete(emailChangeKey)
 		tx.Delete(pushSubscriptionsKey)
 		tx.Delete(metadataKey)
+		tx.Delete(nostrIdentifierKey)
 
 		return nil
 	})

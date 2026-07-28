@@ -5,9 +5,11 @@ package cloaks
 import (
 	"fmt"
 	"net"
+	"strings"
 
 	"crypto/sha3"
 
+	"github.com/ergochat/ergo/irc/nostr"
 	"github.com/ergochat/ergo/irc/utils"
 )
 
@@ -19,6 +21,7 @@ type CloakConfig struct {
 	CidrLenIPv6        int    `yaml:"cidr-len-ipv6"`
 	NumBits            int    `yaml:"num-bits"`
 	LegacySecretValue  string `yaml:"secret"`
+	NostrHostnames     bool   `yaml:"nostr-hostnames"` // enable nostr-based hostnames for accounts registered with nostr
 
 	secret   string
 	numBytes int
@@ -92,4 +95,41 @@ func (config *CloakConfig) ComputeAccountCloak(accountName string) string {
 	paddedAccountName := make([]byte, 16+len(accountName))
 	copy(paddedAccountName[16:], accountName[:])
 	return config.macAndCompose(paddedAccountName)
+}
+
+// ComputeNostrHostname generates a readable hostname from a nostr identifier
+func (config *CloakConfig) ComputeNostrHostname(nostrIdentifier string) string {
+	if nostrIdentifier == "" {
+		return config.Netname
+	}
+
+	// Handle NIP-05 addresses (alice@example.com -> alice@example.com)
+	if strings.Contains(nostrIdentifier, "@") {
+		parts := strings.SplitN(nostrIdentifier, "@", 2)
+		if len(parts) == 2 {
+			// Return the full NIP-05 address as the hostname
+			return nostrIdentifier
+		}
+	}
+
+	// Handle npub format (npub1abc123... -> npub1abc123....nostr)
+	if strings.HasPrefix(nostrIdentifier, "npub1") {
+		// Use the full npub as hostname
+		return fmt.Sprintf("%s.nostr", nostrIdentifier)
+	}
+
+	// Handle hex pubkey (3bf0c63f... -> convert to npub and use full npub.nostr)
+	if len(nostrIdentifier) == 64 {
+		// Convert hex pubkey to npub format
+		npub, err := nostr.HexToNpub(nostrIdentifier)
+		if err != nil {
+			// Fallback to truncated hex if conversion fails
+			truncated := nostrIdentifier[:8]
+			return fmt.Sprintf("%s.nostr", truncated)
+		}
+		return fmt.Sprintf("%s.nostr", npub)
+	}
+
+	// Fallback to regular account cloak
+	return config.ComputeAccountCloak(nostrIdentifier)
 }

@@ -31,6 +31,8 @@ var (
 	errAccountSuspended               = errors.New(`Account has been suspended`)
 	errAccountVerificationFailed      = errors.New("Account verification failed")
 	errAccountVerificationInvalidCode = errors.New("Invalid account verification code")
+	errValidNostrIdentifierRequired   = errors.New("A valid nostr identifier is required")
+	errUnsupportedCallbackNamespace   = errors.New("Unsupported callback namespace")
 	errAccountUpdateFailed            = errors.New(`Error while updating your account information`)
 	errAccountMustHoldNick            = errors.New(`You must hold that nickname in order to register it`)
 	errAuthRequired                   = errors.New("You must be logged into an account to do this")

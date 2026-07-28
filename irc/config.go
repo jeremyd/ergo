@@ -406,6 +406,13 @@ type AccountRegistrationConfig struct {
 	Throttling         ThrottleConfig
 	// new-style (v2.4 email verification config):
 	EmailVerification email.MailtoConfig `yaml:"email-verification"`
+	// nostr-based account verification, where we send a DM with verification code
+	NostrVerification struct {
+		Enabled       bool          `yaml:"enabled"`
+		PrivateKey    string        `yaml:"private-key"`
+		DefaultRelays []string      `yaml:"default-relays"`
+		Timeout       time.Duration `yaml:"timeout"`
+	} `yaml:"nostr-verification"`
 	// old-style email verification config, with "callbacks":
 	LegacyEnabledCallbacks []string `yaml:"enabled-callbacks"`
 	LegacyCallbacks        struct {

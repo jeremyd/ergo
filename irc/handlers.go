@@ -32,6 +32,7 @@ import (
 	"github.com/ergochat/ergo/irc/history"
 	"github.com/ergochat/ergo/irc/jwt"
 	"github.com/ergochat/ergo/irc/modes"
+	"github.com/ergochat/ergo/irc/nostr"
 	"github.com/ergochat/ergo/irc/oauth2"
 	"github.com/ergochat/ergo/irc/sno"
 	"github.com/ergochat/ergo/irc/utils"
@@ -48,25 +49,42 @@ var (
 func parseCallback(spec string, config *Config) (callbackNamespace string, callbackValue string, err error) {
 	// XXX if we don't require verification, ignore any callback that was passed here
 	// (to avoid confusion in the case where the ircd has no mail server configured)
-	if !config.Accounts.Registration.EmailVerification.Enabled {
+	if !config.Accounts.Registration.EmailVerification.Enabled && !config.Accounts.Registration.NostrVerification.Enabled {
 		callbackNamespace = "*"
 		return
 	}
-	callback := strings.ToLower(spec)
-	if colonIndex := strings.IndexByte(callback, ':'); colonIndex != -1 {
-		callbackNamespace, callbackValue = callback[:colonIndex], callback[colonIndex+1:]
+	if colonIndex := strings.IndexByte(spec, ':'); colonIndex != -1 {
+		callbackNamespace, callbackValue = strings.ToLower(spec[:colonIndex]), spec[colonIndex+1:]
 	} else {
-		// "If a callback namespace is not ... provided, the IRC server MUST use mailto""
-		callbackNamespace = "mailto"
-		callbackValue = callback
+		// Auto-detect callback type based on format
+		if nostr.IsNostrIdentifier(spec) {
+			callbackNamespace = "nostr"
+			callbackValue = spec
+		} else {
+			// "If a callback namespace is not ... provided, the IRC server MUST use mailto""
+			callbackNamespace = "mailto"
+			callbackValue = strings.ToLower(spec)
+		}
 	}
 
-	if config.Accounts.Registration.EmailVerification.Enabled {
-		if callbackNamespace != "mailto" {
-			err = errValidEmailRequired
-		} else if strings.IndexByte(callbackValue, '@') < 1 {
-			err = errValidEmailRequired
+	if callbackNamespace == "mailto" {
+		if config.Accounts.Registration.EmailVerification.Enabled {
+			if strings.IndexByte(callbackValue, '@') < 1 {
+				err = errValidEmailRequired
+			}
+		} else {
+			err = errUnsupportedCallbackNamespace
 		}
+	} else if callbackNamespace == "nostr" {
+		if config.Accounts.Registration.NostrVerification.Enabled {
+			if !nostr.IsValidNostrIdentifier(callbackValue) {
+				err = errValidNostrIdentifierRequired
+			}
+		} else {
+			err = errUnsupportedCallbackNamespace
+		}
+	} else if callbackNamespace != "admin" && callbackNamespace != "none" && callbackNamespace != "*" {
+		err = errUnsupportedCallbackNamespace
 	}
 
 	return
@@ -137,7 +155,14 @@ func sendSuccessfulAccountAuth(service *ircService, client *Client, rb *Response
 	if rb.session.isTor {
 		config := client.server.Config()
 		if config.Server.Cloaks.EnabledForAlwaysOn {
-			cloakedHostname := config.Server.Cloaks.ComputeAccountCloak(details.accountName)
+			// Try nostr hostname first, fallback to regular account cloak
+			var cloakedHostname string
+			if config.Server.Cloaks.NostrHostnames {
+				cloakedHostname = client.server.accounts.ComputeNostrHostname(details.accountName)
+			}
+			if cloakedHostname == "" {
+				cloakedHostname = config.Server.Cloaks.ComputeAccountCloak(details.accountName)
+			}
 			client.setCloakedHostname(cloakedHostname)
 			if client.registered {
 				client.sendChghost(details.nickMask, client.Hostname())
